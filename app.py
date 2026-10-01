@@ -47,6 +47,7 @@ class TokenizeRequest(BaseModel):
 class TokenizeResponse(BaseModel):
     text: str
     tokens: list
+    required_concepts: list
     language: str
 
 
@@ -87,15 +88,16 @@ def build_tokenization_prompt(text: str, source_language: str) -> list:
     user_msg = f"""Follow these steps exactly:
 
 1.  Analyze this {source_language} text: "{text}"
-2.  Extract the key nouns, entities, and concepts for use as search tags.
-3.  **All tags MUST be in {tag_lang}.** Do not mix languages.
-4.  **Correct any spelling errors and standardize abbreviations.**
-5.  Remove all stop words, non-essential words, and duplicate entries.
-6.  If generating {tag_lang} tags, do NOT include any diacritics (Tashkeel / formations).
-7.  Output **NOTHING** except for the completed JSON structure below. Do not use markdown.
+2.  Extract the key nouns, entities, and concepts for broad search tags.
+3.  Identify concepts the user explicitly requires to appear together. For example, "cars and plants" requires both concepts; "cars or plants" requires neither individually.
+4.  **All tags MUST be in {tag_lang}.** Do not mix languages.
+5.  **Correct any spelling errors and standardize abbreviations.**
+6.  Remove stop words, non-essential words, and duplicate entries.
+7.  If generating {tag_lang} tags, do NOT include any diacritics (Tashkeel / formations).
+8.  Output **NOTHING** except for the completed JSON structure below. Do not use markdown.
 
 COPY AND PASTE THIS TEMPLATE, THEN FILL IT IN:
-{{"{json_key}": []}}
+{{"{json_key}": [], "required_concepts": []}}
 
 Your entire response must be only the filled-out template."""
 
@@ -177,10 +179,50 @@ def parse_tokens_from_response(raw_text: str, source_language: str) -> list:
     return fallback
 
 
-def get_tokens_from_govai(text: str, source_language: str) -> list:
+def parse_required_concepts_from_response(raw_text: str) -> list:
+    """Extracts explicit must-match concepts from the structured LLM response."""
+    candidates = []
+    try:
+        candidates.append(json.loads(raw_text))
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    fenced = re.search(r'```(?:json)?\s*(.*?)```', raw_text, re.DOTALL | re.IGNORECASE)
+    if fenced:
+        try:
+            candidates.append(json.loads(fenced.group(1).strip()))
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    brace_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+    if brace_match:
+        try:
+            candidates.append(json.loads(brace_match.group(0)))
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        concepts = candidate.get("required_concepts")
+        if not isinstance(concepts, list):
+            continue
+        cleaned = []
+        seen = set()
+        for concept in concepts:
+            value = clean_token(str(concept))
+            if value and value.casefold() not in seen:
+                seen.add(value.casefold())
+                cleaned.append(value)
+        if cleaned:
+            return cleaned[:6]
+    return []
+
+
+def get_search_intent_from_govai(text: str, source_language: str) -> tuple[list, list]:
     """
     Calls the GovAI chat/completions endpoint to extract search tokens from text.
-    Returns a list of token strings, or raises an exception on failure.
+    Returns broad tokens and explicit must-match concepts, or raises on failure.
     """
     messages = build_tokenization_prompt(text, source_language)
 
@@ -216,7 +258,10 @@ def get_tokens_from_govai(text: str, source_language: str) -> list:
     if not content:
         raise ValueError("Empty content returned from API")
 
-    return parse_tokens_from_response(content, source_language)
+    return (
+        parse_tokens_from_response(content, source_language),
+        parse_required_concepts_from_response(content),
+    )
 
 
 @app.post("/tokenize", response_model=TokenizeResponse)
@@ -237,13 +282,18 @@ async def tokenize(req: TokenizeRequest):
 
     try:
         source_language = "Arabic" if is_arabic(req.text) else "English"
-        tokens = get_tokens_from_govai(req.text, source_language)
+        tokens, required_concepts = get_search_intent_from_govai(req.text, source_language)
 
         # If the LLM returns nothing usable, fall back to whitespace split of the input
         if not tokens:
             tokens = [w.strip() for w in req.text.split() if w.strip()]
 
-        return TokenizeResponse(text=req.text, tokens=tokens, language=source_language)
+        return TokenizeResponse(
+            text=req.text,
+            tokens=tokens,
+            required_concepts=required_concepts,
+            language=source_language,
+        )
 
     except requests.exceptions.RequestException as e:
         logging.error(f"API request error for text: {req.text[:50]}... Error: {e}", exc_info=True)

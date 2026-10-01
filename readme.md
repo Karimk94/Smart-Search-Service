@@ -1,9 +1,9 @@
 # Smart Search Service
 
 A standalone FastAPI microservice that turns a free-text search query (a sentence
-or phrase) into a list of logical search **tokens** — key nouns, entities, and
-concepts — using the GovAI LLM API. These tokens are then used to enrich the
-EDMS hybrid search (embedding vector search + SQL text search).
+or phrase) into broad search **tokens** and explicit **required concepts** using
+the GovAI LLM API. Tokens broaden lexical retrieval; required concepts preserve
+clear conjunctions such as "cars and plants".
 
 It is the "smart search box" companion to the **Embedding Service**: where the
 Embedding Service converts text into a vector, this service converts a sentence
@@ -23,7 +23,8 @@ into the most relevant search terms.
 ```json
 {
   "text": "photos from the Dubai Metro opening ceremony",
-  "tokens": ["Dubai Metro", "opening ceremony", "photos"],
+   "tokens": ["Dubai Metro", "opening ceremony", "photos"],
+   "required_concepts": [],
   "language": "English"
 }
 ```
@@ -52,7 +53,7 @@ Request body:
 ```
 Response body:
 ```json
-{ "text": "...", "tokens": ["...", "..."], "language": "English" }
+{ "text": "...", "tokens": ["...", "..."], "required_concepts": ["..."], "language": "English" }
 ```
 
 ### `GET /health`
@@ -128,14 +129,12 @@ Service. The frontend is unchanged.
 
 In the EDMS API:
 
-- `api_client.py` — `get_search_tokens(text)` calls
+- `api_client.py` — `get_search_intent(text)` calls
   `{SMART_SEARCH_API_URL}/tokenize`.
-- `database/documents.py` — `fetch_documents_from_oracle` calls the token service
-  when a `search_term` is present, then uses the returned tokens to:
-  1. Enrich the SQL `LIKE` keyword conditions (each token becomes a match
-     against `ABSTRACT`, `DOCNAME`, dates, tags, persons).
-  2. Feed an expanded vector query (the original text + tokens) to ChromaDB via
-     the Embedding Service.
+- `database/documents.py` — `fetch_documents_from_oracle` uses tokens to broaden
+   SQL `LIKE` candidates and requires every explicitly required concept to match
+   indexed text. It independently embeds the original sentence and combines
+   keyword/vector rankings with reciprocal-rank fusion.
   If the Smart Search Service is unavailable, it falls back to the raw
   `search_term` exactly as before.
 
